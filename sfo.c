@@ -11,7 +11,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#ifdef _WIN32
+#include <windows.h> // For Windows systems
+#include <io.h> // For _access
+#else
+#include <unistd.h> // For access
+#endif
 
 #if __has_include("<byteswap.h>")
 #include <byteswap.h>
@@ -72,6 +77,16 @@ struct command {
   } param;
 } *commands;
 int commands_count;
+
+struct pkg_table_entry {
+    uint32_t id;
+    uint32_t filename_offset;
+    uint32_t flags1;
+    uint32_t flags2;
+    uint32_t offset;
+    uint32_t size;
+    uint64_t padding;
+} *pkg_table_entry;
 
 void load_header(FILE *file) {
   if (fread(&header, sizeof(struct header), 1, file) != 1) {
@@ -162,7 +177,7 @@ void hexprint(char *array, int array_len) {
 // Debug function
 void print_header(void) {
   fprintf(stderr, "Header:\n");
-  fprintf(stderr, "Size: %d\n", sizeof(header));
+  fprintf(stderr, "Size: %zd\n", sizeof(header));
   fprintf(stderr, ".magic: %u\n", header.magic);
   fprintf(stderr, ".version: %u\n", header.version);
   fprintf(stderr, ".key_table_offset: %u\n", header.key_table_offset);
@@ -174,7 +189,7 @@ void print_header(void) {
 // Debug function
 void print_entries(void) {
   fprintf(stderr, "Index table:\n");
-  fprintf(stderr, "Size: %d\n", sizeof(struct index_table_entry) * header.entries_count);
+  fprintf(stderr, "Size: %zd\n", sizeof(struct index_table_entry) * header.entries_count);
   for (int i = 0; i < header.entries_count; i++) {
     fprintf(stderr, "Entry %d:\n", i);
     fprintf(stderr, "  .key_offset: %u -> \"%s\"\n", entries[i].key_offset,
@@ -229,7 +244,29 @@ void print_data_table(void) {
 
 // Saves all 4 param.sfo parts to a param.sfo file
 void save_to_file(char *file_name) {
+  #ifdef _WIN32
+  // Convert ANSI to UTF-16 for wide output filename
+  int wide_char_count_out = MultiByteToWideChar(CP_UTF8, 0, file_name, -1, NULL, 0); // Use CP_UTF8
+  if (wide_char_count_out == 0) {
+    fprintf(stderr, "MultiByteToWideChar failed (size calculation) for output file, error code: %d\n", GetLastError());
+    return;
+  }
+  wchar_t* wide_output_file_name = (wchar_t*)malloc(wide_char_count_out * sizeof(wchar_t));
+  if (wide_output_file_name == NULL) {
+    perror("malloc failed for wide_output_file_name");
+    return;
+  }
+  if (MultiByteToWideChar(CP_UTF8, 0, file_name, -1, wide_output_file_name, wide_char_count_out) == 0) { // Use CP_UTF8
+    fprintf(stderr, "MultiByteToWideChar failed (conversion) for output file, error code: %d\n", GetLastError());
+    free(wide_output_file_name);
+    return;
+  }
+  file = _wfopen(wide_output_file_name, L"wb");
+// Free memory after use
+  free(wide_output_file_name);
+  #else
   FILE *file = fopen(file_name, "wb");
+  #endif
   if (file == NULL) {
     fprintf(stderr, "Could not open file \"%s\" in write mode.\n", file_name);
     exit(1);
@@ -662,7 +699,7 @@ void set_param(char *type, char *key, char *value) {
 
 // Returns a filename without its path
 char *basename(char *filename) {
-  #if defined(_WIN32) || defined(_WIN64)
+  #ifdef _WIN32
   char *base = strrchr(filename, '\\');
   #else
   char *base = strrchr(filename, '/');
@@ -739,23 +776,23 @@ long int get_ps4_pkg_offset() {
   fread(&pkg_table_offset, 4, 1, file);
   pkg_file_count = bswap_32(pkg_file_count);
   pkg_table_offset = bswap_32(pkg_table_offset);
-  struct pkg_table_entry {
-    uint32_t id;
-    uint32_t filename_offset;
-    uint32_t flags1;
-    uint32_t flags2;
-    uint32_t offset;
-    uint32_t size;
-    uint64_t padding;
-  } pkg_table_entry[pkg_file_count];
+  pkg_table_entry = (struct pkg_table_entry*)malloc(sizeof(struct pkg_table_entry) * pkg_file_count); // Dynamically allocate memory
+  if (pkg_table_entry == NULL) { // Error check
+      fprintf(stderr, "Memory allocation failed for pkg_table_entry.\n");
+      fclose(file);
+      exit(1);
+  }
   fseek(file, pkg_table_offset, SEEK_SET);
   fread(pkg_table_entry, sizeof (struct pkg_table_entry), pkg_file_count, file);
   for (int i = 0; i < pkg_file_count; i++) {
     if (pkg_table_entry[i].id == 1048576) { // param.sfo ID
-      return bswap_32(pkg_table_entry[i].offset);
+      uint32_t offset = bswap_32(pkg_table_entry[i].offset);
+      free(pkg_table_entry);
+      return offset;
     }
   }
   fprintf(stderr, "Could not find a param.sfo file inside the PS4 PKG.\n");
+  free(pkg_table_entry);
   fclose(file);
   exit(1);
 }
@@ -801,7 +838,59 @@ void create_param_sfo(char *file_name) {
   save_to_file(file_name);
 }
 
+#ifdef _WIN32
+// Helper function to free char** argv
+void _free_utf8_argv(char** utf8_argv) {
+  if (utf8_argv) {
+    for (int i = 0; utf8_argv[i] != NULL; ++i) {
+      free(utf8_argv[i]);
+    }
+    free(utf8_argv);
+  }
+}
+// Helper function to convert wchar_t** argv to char** UTF-8
+char** _wargv_to_utf8(wchar_t** wargv, int argc) {
+  char** utf8_argv = (char**)malloc(sizeof(char*) * (argc + 1));
+  if (!utf8_argv) return NULL;
+  utf8_argv[argc] = NULL; // Null terminate
+
+  for (int i = 0; i < argc; ++i) {
+    int bufferSize = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+    if (bufferSize == 0) {
+      _free_utf8_argv(utf8_argv); // Cleanup if error
+      return NULL;
+    }
+    utf8_argv[i] = (char*)malloc(sizeof(char) * bufferSize);
+    if (!utf8_argv[i]) {
+      _free_utf8_argv(utf8_argv); // Cleanup if error
+      return NULL;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, utf8_argv[i], bufferSize, NULL, NULL);
+  }
+  return utf8_argv;
+}
+
+int wmain(int argc, wchar_t *argv[]) {
+  // No need to convert filename here, use wchar_t* for _wfopen directly
+  wchar_t* input_file_name_w = NULL; // Use wchar_t* for filename in wmain
+  char* output_file_name = NULL;
+  char* input_file_name_utf8 = NULL; // Store UTF-8 version if needed later
+
+  // Convert wchar_t* arguments to char* for simplicity
+  char **utf8_argv = _wargv_to_utf8(argv, argc);
+  if (!utf8_argv) {
+      fprintf(stderr, "Failed to convert arguments to UTF-8.\n");
+      return 1;
+  }
+  int result = main_impl(argc, utf8_argv);
+  _free_utf8_argv(utf8_argv);
+  return result;
+}
+
+int main_impl(int argc, char *argv[]) {
+#else
 int main(int argc, char *argv[]) {
+#endif
   atexit(clean_exit);
 
   char *input_file_name = NULL;
@@ -815,6 +904,7 @@ int main(int argc, char *argv[]) {
     if (argv[0][0] != '-') {
       if (input_file_name == NULL) {
         input_file_name = argv[0];
+        printf("input_file_name: %s\n", input_file_name);
       } else {
         fprintf(stderr, "Only 1 input file is allowed. Conflicting file names:\n"
           "  \"%s\"\n  \"%s\"\n", input_file_name, argv[0]);
@@ -947,7 +1037,7 @@ int main(int argc, char *argv[]) {
         case 3: cmd = "set"; break;
       }
       fprintf(stderr, "%s)\n", cmd);
-      fprintf(stderr, "  .param.type: %d\n", commands[i].param.type);
+      fprintf(stderr, "  .param.type: %s\n", commands[i].param.type);
       if (commands[i].param.key) {
         fprintf(stderr, "  .param.key: \"%s\"\n", commands[i].param.key);
       } else {
@@ -969,14 +1059,40 @@ int main(int argc, char *argv[]) {
   }
   // Optionally create file before opening it
   if (option_new_file) {
-    if (!option_force && !access(input_file_name, F_OK)) {
+    #ifdef _WIN32
+    if (!option_force && !_access(input_file_name, 0)) { // 0 for F_OK in _access
+    #else
+    if (!option_force && access(input_file_name, F_OK) == 0) {
+    #endif
       fprintf(stderr, "File \"%s\" already exists.\n", input_file_name);
       exit(1);
     } else {
       create_param_sfo(input_file_name);
     }
   }
+  #ifdef _WIN32
+  int wide_char_count = MultiByteToWideChar(CP_UTF8, 0, input_file_name, -1, NULL, 0); // Use CP_UTF8
+  if (wide_char_count == 0) {
+    fprintf(stderr, "MultiByteToWideChar failed (size calculation) for input file, error code: %d\n", GetLastError());
+    return 1;
+  }
+  wchar_t* wide_input_file_name = (wchar_t*)malloc(wide_char_count * sizeof(wchar_t));
+  if (wide_input_file_name == NULL) {
+    perror("malloc failed for wide_input_file_name");
+    return 1;
+  }
+  if (MultiByteToWideChar(CP_UTF8, 0, input_file_name, -1, wide_input_file_name, wide_char_count) == 0) { // Use CP_UTF8
+    fprintf(stderr, "MultiByteToWideChar failed (conversion) for input file, error code: %d\n", GetLastError());
+    free(wide_input_file_name);
+    return 1;
+  }
+  printf("wide_input_file_name: %ls\n", wide_input_file_name);
+
+  file = _wfopen(wide_input_file_name, L"rb"); // Read only
+  free(wide_input_file_name); // Free memory after it's no longer needed
+  #else
   file = fopen(input_file_name, "rb"); // Read only
+  #endif
   if (file == NULL) {
     fprintf(stderr, "Could not open file \"%s\".\n", input_file_name);
     exit(1);
