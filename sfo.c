@@ -881,6 +881,9 @@ char** _wargv_to_utf8(wchar_t** wargv, int argc) {
 }
 
 int wmain(int argc, wchar_t *argv[]) {
+  if (GetConsoleOutputCP() != 65001 && SetConsoleOutputCP(65001) && SetConsoleCP(65001)) {
+    printf("Successfully set this console to UTF-8 encoding (chcp 65001)\n\n");
+  }
   // No need to convert filename here, use wchar_t* for _wfopen directly
   wchar_t* input_file_name_w = NULL; // Use wchar_t* for filename in wmain
   char* output_file_name = NULL;
