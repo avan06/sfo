@@ -27,12 +27,17 @@ uint32_t bswap_32(uint32_t val) {
   return (val << 16) | (val >> 16);
 }
 #endif
+#define PKG_MAGIC   0x544E437F //1414415231, .CNT
+#define SCEC_MAGIC  0x43454353 //1128612691, SCEC
+#define SFO_MAGIC   0x46535000 //1179865088, PSF\0
+#define SFO_ID      0x100000   //1048576
+#define SFO_VERSION 0x0101     //257, 1.1
 
 // Global variables
-const char program_version[] = "1.02 (January 4, 2022)";
+const char program_version[] = "1.02 (January 4, 2022) - Revised 2025";
 char *program_name;
 char *query_string;
-FILE *file;
+FILE *file; // Used by open input_file_name
 int option_debug;
 int option_decimal;
 int option_force;
@@ -242,28 +247,33 @@ void print_data_table(void) {
   fprintf(stderr, "\n");
 }
 
+#ifdef _WIN32
+FILE* utf8_wfopen(const char* filename, const wchar_t* mode) {
+  int wide_char_count = MultiByteToWideChar(CP_UTF8, 0, filename, -1, NULL, 0);
+  if (wide_char_count == 0) {
+    fprintf(stderr, "MultiByteToWideChar failed (size calculation) for file \"%s\", error code: %d\n", filename, GetLastError());
+    return NULL;
+  }
+  wchar_t* wide_filename = (wchar_t*)malloc(wide_char_count * sizeof(wchar_t));
+  if (wide_filename == NULL) {
+    perror("malloc failed for wide_filename");
+    return NULL;
+  }
+  if (MultiByteToWideChar(CP_UTF8, 0, filename, -1, wide_filename, wide_char_count) == 0) {
+    fprintf(stderr, "MultiByteToWideChar failed (conversion) for file \"%s\", error code: %d\n", filename, GetLastError());
+    free(wide_filename);
+    return NULL;
+  }
+  FILE* file = _wfopen(wide_filename, mode); // Read only
+  free(wide_filename); // Free memory after it's no longer needed
+  return file;
+}
+#endif
+
 // Saves all 4 param.sfo parts to a param.sfo file
 void save_to_file(char *file_name) {
   #ifdef _WIN32
-  // Convert ANSI to UTF-16 for wide output filename
-  int wide_char_count_out = MultiByteToWideChar(CP_UTF8, 0, file_name, -1, NULL, 0); // Use CP_UTF8
-  if (wide_char_count_out == 0) {
-    fprintf(stderr, "MultiByteToWideChar failed (size calculation) for output file, error code: %d\n", GetLastError());
-    return;
-  }
-  wchar_t* wide_output_file_name = (wchar_t*)malloc(wide_char_count_out * sizeof(wchar_t));
-  if (wide_output_file_name == NULL) {
-    perror("malloc failed for wide_output_file_name");
-    return;
-  }
-  if (MultiByteToWideChar(CP_UTF8, 0, file_name, -1, wide_output_file_name, wide_char_count_out) == 0) { // Use CP_UTF8
-    fprintf(stderr, "MultiByteToWideChar failed (conversion) for output file, error code: %d\n", GetLastError());
-    free(wide_output_file_name);
-    return;
-  }
-  file = _wfopen(wide_output_file_name, L"wb");
-// Free memory after use
-  free(wide_output_file_name);
+  FILE* file = utf8_wfopen(file_name, L"wb");
   #else
   FILE *file = fopen(file_name, "wb");
   #endif
@@ -785,7 +795,7 @@ long int get_ps4_pkg_offset() {
   fseek(file, pkg_table_offset, SEEK_SET);
   fread(pkg_table_entry, sizeof (struct pkg_table_entry), pkg_file_count, file);
   for (int i = 0; i < pkg_file_count; i++) {
-    if (pkg_table_entry[i].id == 1048576) { // param.sfo ID
+    if (pkg_table_entry[i].id == SFO_ID) { // param.sfo ID
       uint32_t offset = bswap_32(pkg_table_entry[i].offset);
       free(pkg_table_entry);
       return offset;
@@ -830,8 +840,8 @@ void clean_exit(void) {
 
 // Creates an empty param.sfo file
 void create_param_sfo(char *file_name) {
-  header.magic = 1179865088;
-  header.version = 257;
+  header.magic = SFO_MAGIC;
+  header.version = SFO_VERSION;
   header.key_table_offset = 20;
   header.data_table_offset = 20;
   header.entries_count = 0;
@@ -1071,25 +1081,7 @@ int main(int argc, char *argv[]) {
     }
   }
   #ifdef _WIN32
-  int wide_char_count = MultiByteToWideChar(CP_UTF8, 0, input_file_name, -1, NULL, 0); // Use CP_UTF8
-  if (wide_char_count == 0) {
-    fprintf(stderr, "MultiByteToWideChar failed (size calculation) for input file, error code: %d\n", GetLastError());
-    return 1;
-  }
-  wchar_t* wide_input_file_name = (wchar_t*)malloc(wide_char_count * sizeof(wchar_t));
-  if (wide_input_file_name == NULL) {
-    perror("malloc failed for wide_input_file_name");
-    return 1;
-  }
-  if (MultiByteToWideChar(CP_UTF8, 0, input_file_name, -1, wide_input_file_name, wide_char_count) == 0) { // Use CP_UTF8
-    fprintf(stderr, "MultiByteToWideChar failed (conversion) for input file, error code: %d\n", GetLastError());
-    free(wide_input_file_name);
-    return 1;
-  }
-  printf("wide_input_file_name: %ls\n", wide_input_file_name);
-
-  file = _wfopen(wide_input_file_name, L"rb"); // Read only
-  free(wide_input_file_name); // Free memory after it's no longer needed
+  file = utf8_wfopen(input_file_name, L"rb"); // Read only
   #else
   file = fopen(input_file_name, "rb"); // Read only
   #endif
@@ -1101,11 +1093,11 @@ int main(int argc, char *argv[]) {
   // Get SFO header offset
   uint32_t magic;
   fread(&magic, 4, 1, file);
-  if (magic == 1414415231) { // PS4 PKG file
+  if (magic == PKG_MAGIC) { // PS4 PKG file
     fseek(file, get_ps4_pkg_offset(), SEEK_SET);
-  } else if (magic == 1128612691) { // Disc param.sfo
+  } else if (magic == SCEC_MAGIC) { // Disc param.sfo
     fseek(file, 0x800, SEEK_SET);
-  } else if (magic == 1179865088) { // Param.sfo file
+  } else if (magic == SFO_MAGIC) { // Param.sfo file
     rewind(file);
   } else {
     fprintf(stderr, "Param.sfo magic number not found.\n");
@@ -1128,11 +1120,11 @@ int main(int argc, char *argv[]) {
 
   // If there are any queued commands, run them and save the file
   if (commands_count) {
-    if (magic == 1414415231) {
+    if (magic == PKG_MAGIC) {
       fprintf(stderr, "Cannot edit PKG files.\n");
       exit(1);
     }
-    if (magic == 1128612691) {
+    if (magic == SCEC_MAGIC) {
       fprintf(stderr, "Cannot edit disc param.sfo files.\n");
       exit(1);
     }
